@@ -9,7 +9,7 @@
 SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CURRENTDIR="$( pwd )"
 TODAY=$(date +'%Y%m%d')
-HEXDIR="$CI_WORKSPACE/out"    # absolute link
+HEXDIR="$DRONE_WORKSPACE/out"    # absolute link
 
 cd "${HEXDIR}"
 
