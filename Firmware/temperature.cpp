@@ -30,12 +30,15 @@
 
 
 #include "Marlin.h"
+#include "cmdqueue.h"
 #include "ultralcd.h"
+#include "menu.h"
+#include "conv2str.h"
 #include "sound.h"
 #include "temperature.h"
 #include "cardreader.h"
 
-#include "Sd2PinMap.h"
+#include "SdFatUtil.h"
 
 #include <avr/wdt.h>
 #include "adc.h"
@@ -196,7 +199,9 @@ static uint8_t heater_ttbllen_map[EXTRUDERS] = ARRAY_BY_EXTRUDERS( HEATER_0_TEMP
 
 static float analog2temp(int raw, uint8_t e);
 static float analog2tempBed(int raw);
+#ifdef AMBIENT_MAXTEMP
 static float analog2tempAmbient(int raw);
+#endif
 static void updateTemperaturesFromRawValues();
 
 enum TempRunawayStates
@@ -282,8 +287,10 @@ bool checkAllHotends(void)
     return(result);
 }
 
-  void PID_autotune(float temp, int extruder, int ncycles)
-  {
+// WARNING: the following function has been marked noinline to avoid a GCC 4.9.2 LTO
+//          codegen bug causing a stack overwrite issue in process_commands()
+void __attribute__((noinline)) PID_autotune(float temp, int extruder, int ncycles)
+{
   pid_number_of_cycles = ncycles;
   pid_tuning_finished = false;
   float input = 0.0;
@@ -465,7 +472,7 @@ bool checkAllHotends(void)
 			//SERIAL_ECHOPGM("s. Difference between current and ambient T: ");
 			//MYSERIAL.println(input - temp_ambient);
 
-			if (abs(input - temp_ambient) < 5.0) { 
+			if (fabs(input - temp_ambient) < 5.0) { 
 				temp_runaway_stop(false, (extruder<0));
 				pid_tuning_finished = true;
 				return;
@@ -521,7 +528,7 @@ void setExtruderAutoFanState(uint8_t state)
 	//the fan to either On or Off during certain tests/errors.
 
 	fanState = state;
-	uint8_t newFanSpeed = 0;
+	newFanSpeed = 0;
 	if (fanState & 0x01)
 	{
 #ifdef EXTRUDER_ALTFAN_DETECT
@@ -566,10 +573,7 @@ void checkFanSpeed()
 	static unsigned char fan_speed_errors[2] = { 0,0 };
 #if (defined(FANCHECK) && defined(TACH_0) && (TACH_0 >-1))
 	if ((fan_speed[0] < 20) && (current_temperature[0] > EXTRUDER_AUTO_FAN_TEMPERATURE)){ fan_speed_errors[0]++;}
-	else{
-    fan_speed_errors[0] = 0;
-    host_keepalive();
-  }
+	else fan_speed_errors[0] = 0;
 #endif
 #if (defined(FANCHECK) && defined(TACH_1) && (TACH_1 >-1))
 	if ((fan_speed[1] < 5) && ((blocks_queued() ? block_buffer[block_buffer_tail].fan_speed : fanSpeed) > MIN_PRINT_FAN_SPEED)) fan_speed_errors[1]++;
@@ -632,7 +636,6 @@ void fanSpeedError(unsigned char _fan) {
 		fanSpeedErrorBeep(PSTR("Print fan speed is lower than expected"), MSG_FANCHECK_PRINT);
 		break;
 	}
-    // SERIAL_PROTOCOLLNRPGM(MSG_OK); //This ok messes things up with octoprint.
 }
 #endif //(defined(TACH_0) && TACH_0 >-1) || (defined(TACH_1) && TACH_1 > -1)
 
@@ -902,8 +905,6 @@ void manage_heater()
 		timer02_set_pwm0(soft_pwm_bed << 1);
 	  }
   #endif
-  
-  host_keepalive();
 }
 
 #define PGM_RD_W(x)   (short)pgm_read_word(&x)
@@ -1124,7 +1125,10 @@ void tp_init()
 
   adc_init();
 
-  timer0_init();
+  timer0_init(); //enables the heatbed timer.
+
+  // timer2 already enabled earlier in the code
+  // now enable the COMPB temperature interrupt
   OCR2B = 128;
   TIMSK2 |= (1<<OCIE2B);
   
@@ -1377,33 +1381,15 @@ void temp_runaway_check(int _heater_id, float _target_temperature, float _curren
 
 void temp_runaway_stop(bool isPreheat, bool isBed)
 {
-	cancel_heatup = true;
-	quickStop();
-	if (card.sdprinting)
+    disable_heater();
+    Sound_MakeCustom(200,0,true);
+
+    if (isPreheat)
 	{
-		card.sdprinting = false;
-		card.closefile();
-	}
-	// Clean the input command queue 
-	// This is necessary, because in command queue there can be commands which would later set heater or bed temperature.
-	cmdqueue_reset();
-	
-	disable_heater();
-	disable_x();
-	disable_y();
-	disable_e0();
-	disable_e1();
-	disable_e2();
-	manage_heater();
-	lcd_update(0);
-  Sound_MakeCustom(200,0,true);
-	
-  if (isPreheat)
-	{
-		Stop();
-		isBed ? LCD_ALERTMESSAGEPGM("BED PREHEAT ERROR") : LCD_ALERTMESSAGEPGM("PREHEAT ERROR");
+		lcd_setalertstatuspgm(isBed? PSTR("BED PREHEAT ERROR") : PSTR("PREHEAT ERROR"), LCD_STATUS_CRITICAL);
 		SERIAL_ERROR_START;
-		isBed ? SERIAL_ERRORLNPGM(" THERMAL RUNAWAY ( PREHEAT HEATBED)") : SERIAL_ERRORLNPGM(" THERMAL RUNAWAY ( PREHEAT HOTEND)");
+		isBed ? SERIAL_ERRORLNPGM(" THERMAL RUNAWAY (PREHEAT HEATBED)") : SERIAL_ERRORLNPGM(" THERMAL RUNAWAY (PREHEAT HOTEND)");
+
 #ifdef EXTRUDER_ALTFAN_DETECT
 		altfanStatus.altfanOverride = 1; //full speed
 #endif //EXTRUDER_ALTFAN_DETECT
@@ -1414,16 +1400,16 @@ void temp_runaway_stop(bool isPreheat, bool isBed)
 #else //FAN_SOFT_PWM
 		analogWrite(FAN_PIN, 255);
 #endif //FAN_SOFT_PWM
-
 		fanSpeed = 255;
-		delayMicroseconds(2000);
 	}
 	else
 	{
-		isBed ? LCD_ALERTMESSAGEPGM("BED THERMAL RUNAWAY") : LCD_ALERTMESSAGEPGM("THERMAL RUNAWAY");
+		lcd_setalertstatuspgm(isBed? PSTR("BED THERMAL RUNAWAY") : PSTR("THERMAL RUNAWAY"), LCD_STATUS_CRITICAL);
 		SERIAL_ERROR_START;
 		isBed ? SERIAL_ERRORLNPGM(" HEATBED THERMAL RUNAWAY") : SERIAL_ERRORLNPGM(" HOTEND THERMAL RUNAWAY");
 	}
+
+    Stop();
 }
 #endif
 
@@ -1479,13 +1465,12 @@ uint8_t last_alert_sent_to_lcd = LCDALERT_NONE;
 
 //! update the current temperature error message
 //! @param type short error abbreviation (PROGMEM)
-//! @param func optional lcd update function (lcd_setalertstatus when first setting the error)
-void temp_update_messagepgm(const char* PROGMEM type, void (*func)(const char*) = lcd_updatestatus)
+void temp_update_messagepgm(const char* PROGMEM type)
 {
     char msg[LCD_WIDTH];
     strcpy_P(msg, PSTR("Err: "));
     strcat_P(msg, type);
-    (*func)(msg);
+    lcd_setalertstatus(msg, LCD_STATUS_CRITICAL);
 }
 
 //! signal a temperature error on both the lcd and serial
@@ -1493,7 +1478,7 @@ void temp_update_messagepgm(const char* PROGMEM type, void (*func)(const char*) 
 //! @param e optional extruder index for hotend errors
 void temp_error_messagepgm(const char* PROGMEM type, uint8_t e = EXTRUDERS)
 {
-    temp_update_messagepgm(type, lcd_setalertstatus);
+    temp_update_messagepgm(type);
 
     SERIAL_ERROR_START;
 
@@ -2044,21 +2029,24 @@ FORCE_INLINE static void temperature_isr()
    
     if(curTodo>0)
     {
-		asm("cli");
+      CRITICAL_SECTION_START;
       babystep(axis,/*fwd*/true);
       babystepsTodo[axis]--; //less to do next time
-		asm("sei");
+      CRITICAL_SECTION_END;
     }
     else
     if(curTodo<0)
     {
-		asm("cli");
+      CRITICAL_SECTION_START;
       babystep(axis,/*fwd*/false);
       babystepsTodo[axis]++; //less to do next time
-		asm("sei");
+      CRITICAL_SECTION_END;
     }
   }
 #endif //BABYSTEPPING
+
+  // Check if a stack overflow happened
+  if (!SdFatUtil::test_stack_integrity()) stack_error();
 
 #if (defined(FANCHECK) && defined(TACH_0) && (TACH_0 > -1))
   check_fans();
@@ -2325,11 +2313,22 @@ float unscalePID_d(float d)
 //!
 //! @retval true firmware should do temperature compensation and allow calibration
 //! @retval false PINDA thermistor is not detected, disable temperature compensation and calibration
+//! @retval true/false when forced via LCD menu Settings->HW Setup->SuperPINDA
 //!
 bool has_temperature_compensation()
 {
-#ifdef DETECT_SUPERPINDA
-    return (current_temperature_pinda >= PINDA_MINTEMP) ? true : false;
+#ifdef SUPERPINDA_SUPPORT
+#ifdef PINDA_TEMP_COMP
+   	uint8_t pinda_temp_compensation = eeprom_read_byte((uint8_t*)EEPROM_PINDA_TEMP_COMPENSATION);
+    if (pinda_temp_compensation == EEPROM_EMPTY_VALUE) //Unkown PINDA temp compenstation, so check it.
+      {
+#endif //PINDA_TEMP_COMP
+        return (current_temperature_pinda >= PINDA_MINTEMP) ? true : false;
+#ifdef PINDA_TEMP_COMP
+      }
+    else if (pinda_temp_compensation == 0) return true; //Overwritten via LCD menu SuperPINDA [No]
+    else return false; //Overwritten via LCD menu SuperPINDA [YES]
+#endif //PINDA_TEMP_COMP
 #else
     return true;
 #endif

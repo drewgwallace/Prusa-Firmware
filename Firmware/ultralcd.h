@@ -1,13 +1,7 @@
 #ifndef ULTRALCD_H
 #define ULTRALCD_H
 
-#include "Marlin.h"
-#include "lcd.h"
-#include "conv2str.h"
-#include "menu.h"
 #include "mesh_bed_calibration.h"
-#include "config.h"
-
 #include "config.h"
 
 extern void menu_lcd_longpress_func(void);
@@ -18,13 +12,20 @@ extern void menu_lcd_lcdupdate_func(void);
 void ultralcd_init();
 void lcd_setstatus(const char* message);
 void lcd_setstatuspgm(const char* message);
+
+//! LCD status severities
+#define LCD_STATUS_CRITICAL 2 //< Heater failure
+#define LCD_STATUS_ALERT    1 //< Other hardware issue
+#define LCD_STATUS_NONE     0 //< No alert message set
+
 //! return to the main status screen and display the alert message
 //! Beware - it has sideeffects:
 //! - always returns the display to the main status screen
 //! - always makes lcd_reset (which is slow and causes flicker)
-//! - does not update the message if there is already one (i.e. lcd_status_message_level > 0)
-void lcd_setalertstatus(const char* message);
-void lcd_setalertstatuspgm(const char* message);
+//! - does not update the message if there is one with the same (or higher) severity present
+void lcd_setalertstatus(const char* message, uint8_t severity = LCD_STATUS_ALERT);
+void lcd_setalertstatuspgm(const char* message, uint8_t severity = LCD_STATUS_ALERT);
+
 //! only update the alert message on the main status screen
 //! has no sideeffects, may be called multiple times
 void lcd_updatestatus(const char *message);
@@ -44,11 +45,10 @@ void lcd_change_success();
 void lcd_loading_color();
 void lcd_sdcard_stop();
 void lcd_pause_print();
+void lcd_pause_usb_print();
 void lcd_resume_print();
 void lcd_print_stop();
 void prusa_statistics(int _message, uint8_t _col_nr = 0);
-void lcd_confirm_print();
-unsigned char lcd_choose_color();
 void lcd_load_filament_color_check();
 //void lcd_mylang();
 
@@ -115,21 +115,26 @@ extern int8_t FSensorStateMenu;
 
 enum class CustomMsg : uint_least8_t
 {
-	Status,          //!< status message from lcd_status_message variable
-	MeshBedLeveling, //!< Mesh bed leveling in progress
-	FilamentLoading, //!< Loading filament in progress
-	PidCal,          //!< PID tuning in progress
-	TempCal,         //!< PINDA temperature calibration
-	TempCompPreheat, //!< Temperature compensation preheat
+    Status,          //!< status message from lcd_status_message variable
+    MeshBedLeveling, //!< Mesh bed leveling in progress
+    FilamentLoading, //!< Loading filament in progress
+    PidCal,          //!< PID tuning in progress
+    TempCal,         //!< PINDA temperature calibration
+    TempCompPreheat, //!< Temperature compensation preheat
+    M0Wait,          //!< M0/M1 Wait command working even from SD
+    MsgUpdate,       //!< Short message even while printing from SD
+    Resuming,       //!< Resuming message
 };
 
 extern CustomMsg custom_message_type;
 extern unsigned int custom_message_state;
 
 extern uint8_t farm_mode;
-extern int farm_no;
 extern int farm_timer;
 extern uint8_t farm_status;
+
+extern bool UserECoolEnabled();
+extern bool FarmOrUserECool();
 
 #ifdef TMC2130
 #define SILENT_MODE_NORMAL 0
@@ -152,6 +157,8 @@ extern uint8_t SilentModeMenu_MMU;
 
 extern bool cancel_heatup;
 extern bool isPrintPaused;
+
+extern uint8_t scrollstuff;
 
 
 void lcd_ignore_click(bool b=true);
@@ -191,22 +198,16 @@ extern bool bFilamentAction;
 void mFilamentItem(uint16_t nTemp,uint16_t nTempBed);
 void mFilamentItemForce();
 void lcd_generic_preheat_menu();
-void unload_filament();
+void unload_filament(bool automatic = false);
 
-void stack_error();
 void lcd_printer_connected();
 void lcd_ping();
 
 void lcd_calibrate_extruder();
-void lcd_farm_sdcard_menu();
-
-//void getFileDescription(char *name, char *description);
-
-void lcd_farm_sdcard_menu_w();
-//void get_description();
 
 void lcd_wait_for_heater();
 void lcd_wait_for_cool_down();
+void lcd_move_e(); // NOT static due to usage in Marlin_main
 void lcd_extr_cal_reset();
 
 void lcd_temp_cal_show_result(bool result);
@@ -225,10 +226,7 @@ void lcd_temp_calibration_set();
 
 void display_loading();
 
-#if !SDSORT_USES_RAM
 void lcd_set_degree();
-void lcd_set_progress();
-#endif
 
 #if (LANG_MODE != 0)
 void lcd_language();
@@ -261,5 +259,9 @@ void lcd_wizard(WizState state);
 
 extern void lcd_experimental_toggle();
 extern void lcd_experimental_menu();
+
+#ifdef PINDA_TEMP_COMP
+extern void lcd_pinda_temp_compensation_toggle();
+#endif //PINDA_TEMP_COMP
 
 #endif //ULTRALCD_H

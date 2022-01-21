@@ -67,7 +67,7 @@ bool has_temperature_compensation();
 #endif
 
 #ifdef AMBIENT_THERMISTOR
-//extern int current_temperature_raw_ambient;
+extern int current_temperature_raw_ambient;
 extern float current_temperature_ambient;
 #endif
 
@@ -99,13 +99,10 @@ extern bool bedPWMDisabled;
   float unscalePID_d(float d);
 
 #endif
-  
-  
-#ifdef BABYSTEPPING
-  extern volatile int babystepsTodo[3];
-#endif
 
-void resetPID(uint8_t extruder);
+
+#ifdef BABYSTEPPING
+extern volatile int babystepsTodo[3];
 
 inline void babystepsTodoZadd(int n)
 {
@@ -115,15 +112,9 @@ inline void babystepsTodoZadd(int n)
         CRITICAL_SECTION_END
     }
 }
+#endif
 
-inline void babystepsTodoZsubtract(int n)
-{
-    if (n != 0) {
-        CRITICAL_SECTION_START
-        babystepsTodo[Z_AXIS] -= n;
-        CRITICAL_SECTION_END
-    }
-}
+void resetPID(uint8_t extruder);
 
 //high level conversion routines, for use outside of temperature.cpp
 //inline so that there is no performance decrease.
@@ -229,7 +220,7 @@ FORCE_INLINE bool isCoolingBed() {
 #define CHECK_ALL_HEATERS (checkAllHotends()||(target_temperature_bed!=0))
 
 int getHeaterPower(int heater);
-void disable_heater();
+void disable_heater(); // Disable all heaters
 void updatePID();
 
 
