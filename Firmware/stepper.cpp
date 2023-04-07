@@ -36,13 +36,12 @@
 #include "tmc2130.h"
 #endif //TMC2130
 
-#if defined(FILAMENT_SENSOR) && defined(PAT9125)
-#include "fsensor.h"
-int fsensor_counter; //counter for e-steps
-#endif //FILAMENT_SENSOR
+#include "Filament_sensor.h"
 
-#include "mmu.h"
+#include "mmu2.h"
 #include "ConfigurationStore.h"
+
+#include "Prusa_farm.h"
 
 #ifdef DEBUG_STACK_MONITOR
 uint16_t SP_min = 0x21FF;
@@ -108,12 +107,7 @@ static_assert(TMC2130_MINIMUM_DELAY 1, // this will fail to compile when non-emp
 //=============================public variables  ============================
 //===========================================================================
 block_t *current_block;  // A pointer to the block currently being traced
-bool x_min_endstop = false;
-bool x_max_endstop = false;
-bool y_min_endstop = false;
-bool y_max_endstop = false;
-bool z_min_endstop = false;
-bool z_max_endstop = false;
+
 //===========================================================================
 //=============================private variables ============================
 //===========================================================================
@@ -133,11 +127,11 @@ static uint8_t  step_loops;
 static uint16_t OCR1A_nominal;
 static uint8_t  step_loops_nominal;
 
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
 volatile long endstops_trigsteps[3]={0,0,0};
-volatile long endstops_stepsTotal,endstops_stepsDone;
-static volatile bool endstop_x_hit=false;
-static volatile bool endstop_y_hit=false;
-static volatile bool endstop_z_hit=false;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+
+static volatile uint8_t endstop_hit = 0;
 #ifdef ABORT_ON_ENDSTOP_HIT_FEATURE_ENABLED
 bool abort_on_endstop_hit = false;
 #endif
@@ -147,17 +141,8 @@ bool abort_on_endstop_hit = false;
   int motor_current_setting_loud[3] = DEFAULT_PWM_MOTOR_CURRENT_LOUD;
 #endif
 
-#if ( (defined(X_MAX_PIN) && (X_MAX_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_XMAXLIMIT)
-static bool old_x_max_endstop=false;
-#endif
-#if ( (defined(Y_MAX_PIN) && (Y_MAX_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_YMAXLIMIT)
-static bool old_y_max_endstop=false;
-#endif
-
-static bool old_x_min_endstop=false;
-static bool old_y_min_endstop=false;
-static bool old_z_min_endstop=false;
-static bool old_z_max_endstop=false;
+static uint8_t endstop = 0;
+static uint8_t old_endstop = 0;
 
 static bool check_endstops = true;
 
@@ -206,34 +191,32 @@ extern uint16_t stepper_timer_overflow_last;
 
 void checkHitEndstops()
 {
- if( endstop_x_hit || endstop_y_hit || endstop_z_hit) {
+ if(endstop_hit) {
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
    SERIAL_ECHO_START;
    SERIAL_ECHORPGM(MSG_ENDSTOPS_HIT);
-   if(endstop_x_hit) {
+   if(endstop_hit & _BV(X_AXIS)) {
      SERIAL_ECHOPAIR(" X:",(float)endstops_trigsteps[X_AXIS]/cs.axis_steps_per_unit[X_AXIS]);
 //     LCD_MESSAGERPGM(CAT2((MSG_ENDSTOPS_HIT), PSTR("X")));
    }
-   if(endstop_y_hit) {
+   if(endstop_hit & _BV(Y_AXIS)) {
      SERIAL_ECHOPAIR(" Y:",(float)endstops_trigsteps[Y_AXIS]/cs.axis_steps_per_unit[Y_AXIS]);
 //     LCD_MESSAGERPGM(CAT2((MSG_ENDSTOPS_HIT), PSTR("Y")));
    }
-   if(endstop_z_hit) {
+   if(endstop_hit & _BV(Z_AXIS)) {
      SERIAL_ECHOPAIR(" Z:",(float)endstops_trigsteps[Z_AXIS]/cs.axis_steps_per_unit[Z_AXIS]);
 //     LCD_MESSAGERPGM(CAT2((MSG_ENDSTOPS_HIT),PSTR("Z")));
    }
    SERIAL_ECHOLN("");
-   endstop_x_hit=false;
-   endstop_y_hit=false;
-   endstop_z_hit=false;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+   endstop_hit = 0;
 #if defined(ABORT_ON_ENDSTOP_HIT_FEATURE_ENABLED) && defined(SDSUPPORT)
    if (abort_on_endstop_hit)
    {
      card.sdprinting = false;
      card.closefile();
      quickStop();
-     setTargetHotend0(0);
-     setTargetHotend1(0);
-     setTargetHotend2(0);
+     setTargetHotend(0);
    }
 #endif
  }
@@ -241,17 +224,17 @@ void checkHitEndstops()
 
 bool endstops_hit_on_purpose()
 {
-  bool hit = endstop_x_hit || endstop_y_hit || endstop_z_hit;
-  endstop_x_hit=false;
-  endstop_y_hit=false;
-  endstop_z_hit=false;
-  return hit;
+  uint8_t old = endstop_hit;
+  endstop_hit = 0;
+  return old;
 }
 
 bool endstop_z_hit_on_purpose()
 {
-  bool hit = endstop_z_hit;
-  endstop_z_hit=false;
+  bool hit = endstop_hit & _BV(Z_AXIS);
+CRITICAL_SECTION_START;
+  endstop_hit &= ~_BV(Z_AXIS);
+CRITICAL_SECTION_END;
   return hit;
 }
 
@@ -266,7 +249,9 @@ bool enable_z_endstop(bool check)
 {
 	bool old = check_z_endstop;
 	check_z_endstop = check;
-	endstop_z_hit = false;
+CRITICAL_SECTION_START;
+	endstop_hit &= ~_BV(Z_AXIS);
+CRITICAL_SECTION_END;
 	return old;
 }
 
@@ -458,26 +443,15 @@ FORCE_INLINE void stepper_next_block()
     }
     if ((out_bits & (1 << E_AXIS)) != 0) { // -direction
 #ifndef LIN_ADVANCE
-      WRITE(E0_DIR_PIN, 
-  #ifdef SNMM
-        (mmu_extruder == 0 || mmu_extruder == 2) ? !INVERT_E0_DIR :
-  #endif // SNMM
-        INVERT_E0_DIR);
+      WRITE(E0_DIR_PIN, INVERT_E0_DIR);
 #endif /* LIN_ADVANCE */
       count_direction[E_AXIS] = -1;
     } else { // +direction
 #ifndef LIN_ADVANCE
-      WRITE(E0_DIR_PIN,
-  #ifdef SNMM
-        (mmu_extruder == 0 || mmu_extruder == 2) ? INVERT_E0_DIR :
-  #endif // SNMM
-        !INVERT_E0_DIR);
+      WRITE(E0_DIR_PIN, !INVERT_E0_DIR);
 #endif /* LIN_ADVANCE */
       count_direction[E_AXIS] = 1;
     }
-#if defined(FILAMENT_SENSOR) && defined(PAT9125)
-    fsensor_st_block_begin(count_direction[E_AXIS] < 0);
-#endif //FILAMENT_SENSOR
   }
   else {
       _NEXT_ISR(2000); // 1kHz.
@@ -501,6 +475,9 @@ FORCE_INLINE void stepper_check_endstops()
 {
   if(check_endstops) 
   {
+    uint8_t _endstop_hit = endstop_hit;
+    uint8_t _endstop = endstop;
+    uint8_t _old_endstop = old_endstop;
     #ifndef COREXY
     if ((out_bits & (1<<X_AXIS)) != 0) // stepping along -X axis
     #else
@@ -510,33 +487,35 @@ FORCE_INLINE void stepper_check_endstops()
       #if ( (defined(X_MIN_PIN) && (X_MIN_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_XMINLIMIT)
       #ifdef TMC2130_SG_HOMING
         // Stall guard homing turned on
-        x_min_endstop = (READ(X_TMC2130_DIAG) != 0);
+        SET_BIT_TO(_endstop, X_AXIS, (!READ(X_TMC2130_DIAG)));
       #else
         // Normal homing
-        x_min_endstop = (READ(X_MIN_PIN) != X_MIN_ENDSTOP_INVERTING);
+        SET_BIT_TO(_endstop, X_AXIS, (READ(X_MIN_PIN) != X_MIN_ENDSTOP_INVERTING));
       #endif
-        if(x_min_endstop && old_x_min_endstop && (current_block->steps_x.wide > 0)) {
+        if((_endstop & _old_endstop & _BV(X_AXIS)) && (current_block->steps_x.wide > 0)) {
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
           endstops_trigsteps[X_AXIS] = count_position[X_AXIS];
-          endstop_x_hit=true;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+          _endstop_hit |= _BV(X_AXIS);
           step_events_completed.wide = current_block->step_event_count.wide;
         }
-        old_x_min_endstop = x_min_endstop;
       #endif
     } else { // +direction
       #if ( (defined(X_MAX_PIN) && (X_MAX_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_XMAXLIMIT)          
         #ifdef TMC2130_SG_HOMING
         // Stall guard homing turned on
-            x_max_endstop = (READ(X_TMC2130_DIAG) != 0);
+          SET_BIT_TO(_endstop, X_AXIS + 4, (!READ(X_TMC2130_DIAG)));
         #else
         // Normal homing
-        x_max_endstop = (READ(X_MAX_PIN) != X_MAX_ENDSTOP_INVERTING);
+          SET_BIT_TO(_endstop, X_AXIS + 4, (READ(X_MAX_PIN) != X_MAX_ENDSTOP_INVERTING));
         #endif
-        if(x_max_endstop && old_x_max_endstop && (current_block->steps_x.wide > 0)){
+        if((_endstop & _old_endstop & _BV(X_AXIS + 4)) && (current_block->steps_x.wide > 0)){
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
           endstops_trigsteps[X_AXIS] = count_position[X_AXIS];
-          endstop_x_hit=true;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+          _endstop_hit |= _BV(X_AXIS);
           step_events_completed.wide = current_block->step_event_count.wide;
         }
-        old_x_max_endstop = x_max_endstop;
       #endif
     }
 
@@ -545,37 +524,39 @@ FORCE_INLINE void stepper_check_endstops()
     #else
     if ((((out_bits & (1<<X_AXIS)) != 0)&&(out_bits & (1<<Y_AXIS)) == 0)) // -Y occurs for -A and +B
     #endif
-    {        
+    {
       #if ( (defined(Y_MIN_PIN) && (Y_MIN_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_YMINLIMIT)          
       #ifdef TMC2130_SG_HOMING
       // Stall guard homing turned on
-          y_min_endstop = (READ(Y_TMC2130_DIAG) != 0);
+        SET_BIT_TO(_endstop, Y_AXIS, (!READ(Y_TMC2130_DIAG)));
       #else
       // Normal homing
-      y_min_endstop = (READ(Y_MIN_PIN) != Y_MIN_ENDSTOP_INVERTING);
+        SET_BIT_TO(_endstop, Y_AXIS, (READ(Y_MIN_PIN) != Y_MIN_ENDSTOP_INVERTING));
       #endif
-        if(y_min_endstop && old_y_min_endstop && (current_block->steps_y.wide > 0)) {
+        if((_endstop & _old_endstop & _BV(Y_AXIS)) && (current_block->steps_y.wide > 0)) {
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
           endstops_trigsteps[Y_AXIS] = count_position[Y_AXIS];
-          endstop_y_hit=true;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+          _endstop_hit |= _BV(Y_AXIS);
           step_events_completed.wide = current_block->step_event_count.wide;
         }
-        old_y_min_endstop = y_min_endstop;
       #endif
     } else { // +direction
       #if ( (defined(Y_MAX_PIN) && (Y_MAX_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_YMAXLIMIT)                
         #ifdef TMC2130_SG_HOMING
         // Stall guard homing turned on
-            y_max_endstop = (READ(Y_TMC2130_DIAG) != 0);
+          SET_BIT_TO(_endstop, Y_AXIS + 4, (!READ(Y_TMC2130_DIAG)));
         #else
         // Normal homing
-        y_max_endstop = (READ(Y_MAX_PIN) != Y_MAX_ENDSTOP_INVERTING);
+          SET_BIT_TO(_endstop, Y_AXIS + 4, (READ(Y_MAX_PIN) != Y_MAX_ENDSTOP_INVERTING));
         #endif
-        if(y_max_endstop && old_y_max_endstop && (current_block->steps_y.wide > 0)){
+        if((_endstop & _old_endstop & _BV(Y_AXIS + 4)) && (current_block->steps_y.wide > 0)){
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
           endstops_trigsteps[Y_AXIS] = count_position[Y_AXIS];
-          endstop_y_hit=true;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+          _endstop_hit |= _BV(Y_AXIS);
           step_events_completed.wide = current_block->step_event_count.wide;
         }
-        old_y_max_endstop = y_max_endstop;
       #endif
     }
 
@@ -586,20 +567,21 @@ FORCE_INLINE void stepper_check_endstops()
         #ifdef TMC2130_SG_HOMING
           // Stall guard homing turned on
 #ifdef TMC2130_STEALTH_Z
-		  if ((tmc2130_mode == TMC2130_MODE_SILENT) && !(tmc2130_sg_homing_axes_mask & 0x04))
-	          z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
-		  else
+          if ((tmc2130_mode == TMC2130_MODE_SILENT) && !(tmc2130_sg_homing_axes_mask & 0x04))
+            SET_BIT_TO(_endstop, Z_AXIS, (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING));
+          else
 #endif //TMC2130_STEALTH_Z
-	          z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING) || (READ(Z_TMC2130_DIAG) != 0);
+            SET_BIT_TO(_endstop, Z_AXIS, (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING) || (!READ(Z_TMC2130_DIAG)));
         #else
-          z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+          SET_BIT_TO(_endstop, Z_AXIS, (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING));
         #endif //TMC2130_SG_HOMING
-        if(z_min_endstop && old_z_min_endstop && (current_block->steps_z.wide > 0)) {
+        if((_endstop & _old_endstop & _BV(Z_AXIS)) && (current_block->steps_z.wide > 0)) {
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
           endstops_trigsteps[Z_AXIS] = count_position[Z_AXIS];
-          endstop_z_hit=true;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+          _endstop_hit |= _BV(Z_AXIS);
           step_events_completed.wide = current_block->step_event_count.wide;
         }
-        old_z_min_endstop = z_min_endstop;
       }
       #endif
     } else { // +direction
@@ -607,46 +589,57 @@ FORCE_INLINE void stepper_check_endstops()
         #ifdef TMC2130_SG_HOMING
         // Stall guard homing turned on
 #ifdef TMC2130_STEALTH_Z
-		  if ((tmc2130_mode == TMC2130_MODE_SILENT) && !(tmc2130_sg_homing_axes_mask & 0x04))
-	          z_max_endstop = false;
-		  else
+        if ((tmc2130_mode == TMC2130_MODE_SILENT) && !(tmc2130_sg_homing_axes_mask & 0x04))
+          SET_BIT_TO(_endstop, Z_AXIS + 4, 0);
+        else
 #endif //TMC2130_STEALTH_Z
-        z_max_endstop = (READ(Z_TMC2130_DIAG) != 0);
+          SET_BIT_TO(_endstop, Z_AXIS + 4, (!READ(Z_TMC2130_DIAG)));
         #else
-        z_max_endstop = (READ(Z_MAX_PIN) != Z_MAX_ENDSTOP_INVERTING);
+        SET_BIT_TO(_endstop, Z_AXIS + 4, (READ(Z_MAX_PIN) != Z_MAX_ENDSTOP_INVERTING));
         #endif //TMC2130_SG_HOMING
-        if(z_max_endstop && old_z_max_endstop && (current_block->steps_z.wide > 0)) {
+        if((_endstop & _old_endstop & _BV(Z_AXIS + 4)) && (current_block->steps_z.wide > 0)) {
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
           endstops_trigsteps[Z_AXIS] = count_position[Z_AXIS];
-          endstop_z_hit=true;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+          _endstop_hit |= _BV(Z_AXIS);
           step_events_completed.wide = current_block->step_event_count.wide;
         }
-        old_z_max_endstop = z_max_endstop;
       #endif
     }
+    endstop = _endstop;
+    old_endstop = _endstop; //apply current endstop state to the old endstop
+    endstop_hit = _endstop_hit;
   }
 
   // Supporting stopping on a trigger of the Z-stop induction sensor, not only for the Z-minus movements.
   #if defined(Z_MIN_PIN) && (Z_MIN_PIN > -1) && !defined(DEBUG_DISABLE_ZMINLIMIT)
   if (check_z_endstop) {
+      uint8_t _endstop_hit = endstop_hit;
+      uint8_t _endstop = endstop;
+      uint8_t _old_endstop = old_endstop;
       // Check the Z min end-stop no matter what.
       // Good for searching for the center of an induction target.
       #ifdef TMC2130_SG_HOMING
       // Stall guard homing turned on
 #ifdef TMC2130_STEALTH_Z
-		  if ((tmc2130_mode == TMC2130_MODE_SILENT) && !(tmc2130_sg_homing_axes_mask & 0x04))
-	          z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
-		  else
+      if ((tmc2130_mode == TMC2130_MODE_SILENT) && !(tmc2130_sg_homing_axes_mask & 0x04))
+        SET_BIT_TO(_endstop, Z_AXIS, (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING));
+      else
 #endif //TMC2130_STEALTH_Z
-       z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING) || (READ(Z_TMC2130_DIAG) != 0);
+        SET_BIT_TO(_endstop, Z_AXIS, (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING) || (!READ(Z_TMC2130_DIAG)));
       #else
-        z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+      SET_BIT_TO(_endstop, Z_AXIS, (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING));
       #endif //TMC2130_SG_HOMING
-      if(z_min_endstop && old_z_min_endstop) {
+      if(_endstop & _old_endstop & _BV(Z_AXIS)) {
+#ifdef VERBOSE_CHECK_HIT_ENDSTOPS
         endstops_trigsteps[Z_AXIS] = count_position[Z_AXIS];
-        endstop_z_hit=true;
+#endif //VERBOSE_CHECK_HIT_ENDSTOPS
+        _endstop_hit |= _BV(Z_AXIS);
         step_events_completed.wide = current_block->step_event_count.wide;
       }
-      old_z_min_endstop = z_min_endstop;
+      endstop = _endstop;
+      old_endstop = _endstop; //apply current endstop state to the old endstop
+      endstop_hit = _endstop_hit;
   }
   #endif
 }
@@ -703,9 +696,9 @@ FORCE_INLINE void stepper_tick_lowres()
 #ifdef LIN_ADVANCE
       e_steps += count_direction[E_AXIS];
 #else
-	#ifdef FILAMENT_SENSOR
-	  fsensor_counter += count_direction[E_AXIS];
-	#endif //FILAMENT_SENSOR
+#if defined(FILAMENT_SENSOR) && (FILAMENT_SENSOR_TYPE == FSENSOR_PAT9125)
+      fsensor.stStep(count_direction[E_AXIS] < 0);
+#endif //defined(FILAMENT_SENSOR) && (FILAMENT_SENSOR_TYPE == FSENSOR_PAT9125)
       STEP_NC_LO(E_AXIS);
 #endif
     }
@@ -765,9 +758,9 @@ FORCE_INLINE void stepper_tick_highres()
 #ifdef LIN_ADVANCE
       e_steps += count_direction[E_AXIS];
 #else
-    #ifdef FILAMENT_SENSOR
-      fsensor_counter += count_direction[E_AXIS];
-    #endif //FILAMENT_SENSOR
+#if defined(FILAMENT_SENSOR) && (FILAMENT_SENSOR_TYPE == FSENSOR_PAT9125)
+      fsensor.stStep(count_direction[E_AXIS] < 0);
+#endif //defined(FILAMENT_SENSOR) && (FILAMENT_SENSOR_TYPE == FSENSOR_PAT9125)
       STEP_NC_LO(E_AXIS);
 #endif
     }
@@ -845,7 +838,7 @@ FORCE_INLINE void isr() {
       //WRITE_NC(LOGIC_ANALYZER_CH1, true);
       if (step_events_completed.wide <= current_block->accelerate_until) {
         // v = t * a   ->   acc_step_rate = acceleration_time * current_block->acceleration_rate
-        MultiU24X24toH16(acc_step_rate, acceleration_time, current_block->acceleration_rate);
+        acc_step_rate = MUL24x24R24(acceleration_time, current_block->acceleration_rate);
         acc_step_rate += uint16_t(current_block->initial_rate);
         // upper limit
         if(acc_step_rate > uint16_t(current_block->nominal_rate))
@@ -865,8 +858,7 @@ FORCE_INLINE void isr() {
 #endif
       }
       else if (step_events_completed.wide > current_block->decelerate_after) {
-        uint16_t step_rate;
-        MultiU24X24toH16(step_rate, deceleration_time, current_block->acceleration_rate);
+        uint16_t step_rate = MUL24x24R24(deceleration_time, current_block->acceleration_rate);
 
         if (step_rate > acc_step_rate) { // Check step_rate stays positive
             step_rate = uint16_t(current_block->final_rate);
@@ -963,21 +955,9 @@ FORCE_INLINE void isr() {
 
     // If current block is finished, reset pointer
     if (step_events_completed.wide >= current_block->step_event_count.wide) {
-#if !defined(LIN_ADVANCE) && defined(FILAMENT_SENSOR)
-		fsensor_st_block_chunk(fsensor_counter);
-		fsensor_counter = 0;
-#endif //FILAMENT_SENSOR
-
       current_block = NULL;
       plan_discard_current_block();
     }
-#if !defined(LIN_ADVANCE) && defined(FILAMENT_SENSOR)
-	else if ((abs(fsensor_counter) >= fsensor_chunk_len))
-  	{
-      fsensor_st_block_chunk(fsensor_counter);
-  	  fsensor_counter = 0;
-  	}
-#endif //FILAMENT_SENSOR
   }
 
 #ifdef TMC2130
@@ -1073,19 +1053,11 @@ FORCE_INLINE void advance_isr_scheduler() {
             STEP_NC_HI(E_AXIS);
             e_steps += (rev? 1: -1);
             STEP_NC_LO(E_AXIS);
-#if defined(FILAMENT_SENSOR) && defined(PAT9125)
-            fsensor_counter += (rev? -1: 1);
-#endif
+#if defined(FILAMENT_SENSOR) && (FILAMENT_SENSOR_TYPE == FSENSOR_PAT9125)
+            fsensor.stStep(rev);
+#endif //defined(FILAMENT_SENSOR) && (FILAMENT_SENSOR_TYPE == FSENSOR_PAT9125)
         }
         while(--max_ticks);
-
-#if defined(FILAMENT_SENSOR) && defined(PAT9125)
-        if (abs(fsensor_counter) >= fsensor_chunk_len)
-        {
-            fsensor_st_block_chunk(fsensor_counter);
-            fsensor_counter = 0;
-        }
-#endif
     }
 
     // Schedule the next closest tick, ignoring advance if scheduled too
@@ -1179,22 +1151,6 @@ void st_init()
   #endif
 
   //endstops and pullups
-
-  #ifdef TMC2130_SG_HOMING
-    SET_INPUT(X_TMC2130_DIAG);
-    WRITE(X_TMC2130_DIAG,HIGH);
-    
-    SET_INPUT(Y_TMC2130_DIAG);
-    WRITE(Y_TMC2130_DIAG,HIGH);
-    
-    SET_INPUT(Z_TMC2130_DIAG);
-    WRITE(Z_TMC2130_DIAG,HIGH);
-
-	SET_INPUT(E0_TMC2130_DIAG);
-    WRITE(E0_TMC2130_DIAG,HIGH);
-    
-  #endif
-    
   #if defined(X_MIN_PIN) && X_MIN_PIN > -1
     SET_INPUT(X_MIN_PIN);
     #ifdef ENDSTOPPULLUP_XMIN
@@ -1375,10 +1331,8 @@ void st_synchronize()
 			lcd_update(0);
 		}
 #else //TMC2130
-		manage_heater();
 		// Vojtech: Don't disable motors inside the planner!
-		manage_inactivity(true);
-		lcd_update(0);
+		delay_keep_alive(0);
 #endif //TMC2130
 	}
 }
@@ -1564,9 +1518,9 @@ void st_current_init() //Initialize Digipot Motor Current
 #ifdef MOTOR_CURRENT_PWM_XY_PIN
   uint8_t SilentMode = eeprom_read_byte((uint8_t*)EEPROM_SILENT);
   SilentModeMenu = SilentMode;
-    pinMode(MOTOR_CURRENT_PWM_XY_PIN, OUTPUT);
-    pinMode(MOTOR_CURRENT_PWM_Z_PIN, OUTPUT);
-    pinMode(MOTOR_CURRENT_PWM_E_PIN, OUTPUT);
+    SET_OUTPUT(MOTOR_CURRENT_PWM_XY_PIN);
+    SET_OUTPUT(MOTOR_CURRENT_PWM_Z_PIN);
+    SET_OUTPUT(MOTOR_CURRENT_PWM_E_PIN);
     if((SilentMode == SILENT_MODE_OFF) || (farm_mode) ){
 
      motor_current_setting[0] = motor_current_setting_loud[0];
@@ -1605,20 +1559,20 @@ void microstep_init()
 {
 
   #if defined(E1_MS1_PIN) && E1_MS1_PIN > -1
-  pinMode(E1_MS1_PIN,OUTPUT);
-  pinMode(E1_MS2_PIN,OUTPUT); 
+  SET_OUTPUT(E1_MS1_PIN);
+  SET_OUTPUT(E1_MS2_PIN); 
   #endif
 
   #if defined(X_MS1_PIN) && X_MS1_PIN > -1
   const uint8_t microstep_modes[] = MICROSTEP_MODES;
-  pinMode(X_MS1_PIN,OUTPUT);
-  pinMode(X_MS2_PIN,OUTPUT);  
-  pinMode(Y_MS1_PIN,OUTPUT);
-  pinMode(Y_MS2_PIN,OUTPUT);
-  pinMode(Z_MS1_PIN,OUTPUT);
-  pinMode(Z_MS2_PIN,OUTPUT);
-  pinMode(E0_MS1_PIN,OUTPUT);
-  pinMode(E0_MS2_PIN,OUTPUT);
+  SET_OUTPUT(X_MS1_PIN);
+  SET_OUTPUT(X_MS2_PIN);  
+  SET_OUTPUT(Y_MS1_PIN);
+  SET_OUTPUT(Y_MS2_PIN);
+  SET_OUTPUT(Z_MS1_PIN);
+  SET_OUTPUT(Z_MS2_PIN);
+  SET_OUTPUT(E0_MS1_PIN);
+  SET_OUTPUT(E0_MS2_PIN);
   for(int i=0;i<=4;i++) microstep_mode(i,microstep_modes[i]);
   #endif
 }
@@ -1630,22 +1584,22 @@ void microstep_ms(uint8_t driver, int8_t ms1, int8_t ms2)
 {
   if(ms1 > -1) switch(driver)
   {
-    case 0: digitalWrite( X_MS1_PIN,ms1); break;
-    case 1: digitalWrite( Y_MS1_PIN,ms1); break;
-    case 2: digitalWrite( Z_MS1_PIN,ms1); break;
-    case 3: digitalWrite(E0_MS1_PIN,ms1); break;
+    case 0: WRITE( X_MS1_PIN,ms1); break;
+    case 1: WRITE( Y_MS1_PIN,ms1); break;
+    case 2: WRITE( Z_MS1_PIN,ms1); break;
+    case 3: WRITE(E0_MS1_PIN,ms1); break;
     #if defined(E1_MS1_PIN) && E1_MS1_PIN > -1
-    case 4: digitalWrite(E1_MS1_PIN,ms1); break;
+    case 4: WRITE(E1_MS1_PIN,ms1); break;
     #endif
   }
   if(ms2 > -1) switch(driver)
   {
-    case 0: digitalWrite( X_MS2_PIN,ms2); break;
-    case 1: digitalWrite( Y_MS2_PIN,ms2); break;
-    case 2: digitalWrite( Z_MS2_PIN,ms2); break;
-    case 3: digitalWrite(E0_MS2_PIN,ms2); break;
+    case 0: WRITE( X_MS2_PIN,ms2); break;
+    case 1: WRITE( Y_MS2_PIN,ms2); break;
+    case 2: WRITE( Z_MS2_PIN,ms2); break;
+    case 3: WRITE(E0_MS2_PIN,ms2); break;
     #if defined(E1_MS2_PIN) && E1_MS2_PIN > -1
-    case 4: digitalWrite(E1_MS2_PIN,ms2); break;
+    case 4: WRITE(E1_MS2_PIN,ms2); break;
     #endif
   }
 }
@@ -1664,33 +1618,23 @@ void microstep_mode(uint8_t driver, uint8_t stepping_mode)
 
 void microstep_readings()
 {
-      SERIAL_PROTOCOLPGM("MS1,MS2 Pins\n");
+      SERIAL_PROTOCOLLNPGM("MS1,MS2 Pins");
       SERIAL_PROTOCOLPGM("X: ");
-      SERIAL_PROTOCOL(   digitalRead(X_MS1_PIN));
-      SERIAL_PROTOCOLLN( digitalRead(X_MS2_PIN));
+      SERIAL_PROTOCOL(   READ(X_MS1_PIN));
+      SERIAL_PROTOCOLLN( READ(X_MS2_PIN));
       SERIAL_PROTOCOLPGM("Y: ");
-      SERIAL_PROTOCOL(   digitalRead(Y_MS1_PIN));
-      SERIAL_PROTOCOLLN( digitalRead(Y_MS2_PIN));
+      SERIAL_PROTOCOL(   READ(Y_MS1_PIN));
+      SERIAL_PROTOCOLLN( READ(Y_MS2_PIN));
       SERIAL_PROTOCOLPGM("Z: ");
-      SERIAL_PROTOCOL(   digitalRead(Z_MS1_PIN));
-      SERIAL_PROTOCOLLN( digitalRead(Z_MS2_PIN));
+      SERIAL_PROTOCOL(   READ(Z_MS1_PIN));
+      SERIAL_PROTOCOLLN( READ(Z_MS2_PIN));
       SERIAL_PROTOCOLPGM("E0: ");
-      SERIAL_PROTOCOL(   digitalRead(E0_MS1_PIN));
-      SERIAL_PROTOCOLLN( digitalRead(E0_MS2_PIN));
+      SERIAL_PROTOCOL(   READ(E0_MS1_PIN));
+      SERIAL_PROTOCOLLN( READ(E0_MS2_PIN));
       #if defined(E1_MS1_PIN) && E1_MS1_PIN > -1
       SERIAL_PROTOCOLPGM("E1: ");
-      SERIAL_PROTOCOL(   digitalRead(E1_MS1_PIN));
-      SERIAL_PROTOCOLLN( digitalRead(E1_MS2_PIN));
+      SERIAL_PROTOCOL(   READ(E1_MS1_PIN));
+      SERIAL_PROTOCOLLN( READ(E1_MS2_PIN));
       #endif
 }
 #endif //TMC2130
-
-
-#if defined(FILAMENT_SENSOR) && defined(PAT9125)
-void st_reset_fsensor()
-{
-    CRITICAL_SECTION_START;
-    fsensor_counter = 0;
-    CRITICAL_SECTION_END;
-}
-#endif //FILAMENT_SENSOR
